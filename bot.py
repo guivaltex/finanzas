@@ -94,12 +94,12 @@ def procesar_inteligencia(texto_transcrito):
 
     REGLAS CRÍTICAS DE INTERPRETACIÓN:
     1. **MONEDA Y NÚMEROS:**
-       - Estamos en Colombia. Si el monto es pequeño (ej: "280", "31") y el contexto es muebles, madera o compras grandes, INTERPRETA MILES (280 -> 280000).
+       - Estamos en Colombia. Si el monto es pequeño (ej: "280", "31", o menor a 1000) y el contexto es muebles, madera o compras grandes, INTERPRETA MILES (280 -> 280000).
        - Si el contexto es comida barata o dulces, mantén el valor bajo (ej: "Dulce 2000" -> 2000).
        - El monto final debe ser un NÚMERO ENTERO SIN PUNTOS NI COMAS (Ej: 280000, no 280.000).
     
     2. **FACTURAS:**
-       - Si escuchas números sueltos asociados a "factura" (ej: "tres uno cinco siete"), ÚNELOS (3157).
+       - Si escuchas números sueltos asociados a "factura", siempre son numeros de 4 digitos para la factura (ej: "tres uno cinco siete"), ÚNELOS (3157).
        - Extrae el número de la factura en su propio campo. Si no hay, pon "NA".
 
     3. **CLASIFICACIÓN (PROHIBIDO USAR NOTA):**
@@ -121,11 +121,11 @@ def procesar_inteligencia(texto_transcrito):
     Input: "Compra de madera por 280 factura tres uno cinco siete"
     Output: GASTO|FABRICA|MATERIALES|280000|compra de madera|3157
 
-    Input: "Abono de la factura 20"
-    Output: INGRESO|FABRICA|ABONO|0|abono factura 20 (Monto 0 si no se dice valor)|20
-
-    Input: "Pago matrícula sofia 3500"
+    Input: "Pago matrícula sofia 3500000"
     Output: GASTO|HOGAR|EDUCACION|3500000|pago matricula sofia|NA
+    
+    Input: "Ingreso fabrica 500 abono silleteria factura trenta y cinco doce"
+    Output: INGRESO|FABRICA|SILLETERIA|500000|abono silleteria|3512
     
     Input: "Nota corregir el valor anterior"
     Output: NOTA|corregir el valor anterior
