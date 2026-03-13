@@ -132,7 +132,7 @@ def procesar_inteligencia(texto_transcrito):
     """
     
     response = client_openai.chat.completions.create(
-        model="gpt-4o-mini",
+        model="gpt-4o",
         messages=[{"role": "user", "content": prompt}],
         temperature=0.0 # Temperatura 0 para máxima precisión y menos creatividad
     )
