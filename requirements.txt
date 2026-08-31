@@ -1,7 +1,0 @@
-python-telegram-bot
-openai
-gspread
-oauth2client
-
-flask
-pytz
