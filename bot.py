@@ -1,219 +1,259 @@
-import os
-import logging
-import threading
+"""Runtime Render: Telegram -> OpenAI -> Cola_Guivaltex_V1."""
 import json
-import unicodedata
-from datetime import datetime
-import pytz # Librería para la hora de Colombia
-from telegram import Update
-from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
-from openai import OpenAI
-import gspread
-from oauth2client.service_account import ServiceAccountCredentials
-from flask import Flask
+import logging
+import os
+import sys
+import threading
 
-# --- CONFIGURACIÓN ---
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON")
+from render_finanzas_api import crear_servidor
+from bot_finanzas import (
+    AutorizacionTelegram,
+    CATEGORIAS_FINANCIERAS_V1,
+    CONTRATO_INTERPRETACION,
+    EventoTelegram,
+    MODELO_INTERPRETACION,
+    MODELO_TRANSCRIPCION,
+    ProcesadorCola,
+    conectar_cola,
+    inspeccionar_spreadsheet,
+    preparar_spreadsheet,
+)
 
-NOMBRE_HOJA_CALCULO = "FinanzasBot" # Asegúrate que coincida con tu Drive
-
-# Configuración de Logs (Menos ruidoso)
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+logging.basicConfig(
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    level=logging.INFO,
+)
 logging.getLogger("httpx").setLevel(logging.WARNING)
+LOGGER = logging.getLogger("guivaltex.bot")
 
-client_openai = OpenAI(api_key=OPENAI_API_KEY)
+INSTRUCCIONES_INTERPRETACION = """
+Interpreta una transcripcion financiera de Guivaltex en Colombia.
+Devuelve exclusivamente el objeto del JSON Schema estricto.
 
-# --- SERVIDOR WEB (KEEP ALIVE) ---
-app = Flask('')
+Reglas:
+- clase=movimiento para gastos/ingresos externos normales.
+- clase=posible_abono para abonos, saldos o cobros que deben registrarse
+  canonicamente desde el modulo Abonos de Guivaltex.
+- clase=nota para una nota no financiera; debe requerir revision.
+- importe es el valor COP normalizado como texto decimal, sin separadores de miles.
+- evidencia_importe copia literalmente solo la expresion del importe.
+- Un numero desnudo entre 1 y 999 significa miles: 180 significa 180000.
+- '180 mil', '180.000' y '180000' significan 180000.
+- Una unidad explicita contradictoria como '180 pesos' requiere revision y no
+  debe convertirse silenciosamente.
+- No hay movimientos finales validos inferiores a COP 1000.
+- fecha_efectiva usa YYYY-MM-DD. Resuelve fechas relativas usando fecha_mensaje.
+- categoria debe ser exactamente una de las categorias entregadas.
+- No inventes factura_id. Conserva el identificador solo si fue mencionado.
+- Si falta evidencia, hay ambiguedad o la categoria no es clara, marca
+  requiere_revision=true y explica motivos breves mediante codigos estables.
+""".strip()
 
-@app.route('/')
-def home():
-    return "Bot Contable Activo 24/7"
 
-def run_flask():
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host='0.0.0.0', port=port)
+def _variable_requerida(nombre):
+    valor = str(os.environ.get(nombre) or "").strip()
+    if not valor:
+        raise RuntimeError("Falta la variable de entorno " + nombre + ".")
+    return valor
 
-def keep_alive():
-    t = threading.Thread(target=run_flask)
-    t.start()
 
-# --- CONEXIÓN GOOGLE SHEETS ---
-def conectar_google():
-    scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
-    
-    if GOOGLE_CREDENTIALS_JSON:
-        creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
-        creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
-    else:
-        # Fallback local
-        creds = ServiceAccountCredentials.from_json_keyfile_name('credenciales_google.json', scope)
-        
-    client_gs = gspread.authorize(creds)
-    return client_gs.open(NOMBRE_HOJA_CALCULO)
+class ServiciosOpenAI:
+    def __init__(self, api_key):
+        from openai import OpenAI
+        self.client = OpenAI(
+            api_key=api_key,
+            timeout=60.0,
+            max_retries=2,
+        )
 
-# --- LÓGICA DE NEGOCIO ---
-
-# Listas de referencia (Solo para contexto, el prompt hace el trabajo duro)
-CAT_INGRESOS = "Venta, Abono, Saldo, Base cama, Espaldar, Sofa, Mesas, Colchon, Silleteria, Refaccion"
-CAT_GASTOS_HOGAR = "Comida, Transporte, Diversion, Dulce, Salidas, Salud, Vivienda, Servicios, Celular, Educacion, Mercado"
-CAT_GASTOS_FABRICA = "Materiales, Onces, Sueldos, Arriendo, Servicios, Deudas, Herramientas, Insumos"
-
-def obtener_fecha_colombia():
-    """Retorna la fecha y hora actual en zona horaria Bogotá"""
-    bogota = pytz.timezone('America/Bogota')
-    return datetime.now(bogota).strftime("%Y-%m-%d %H:%M:%S")
-
-def normalizar_texto(texto):
-    if not texto or texto == "NA": return ""
-    texto = unicodedata.normalize('NFKD', texto).encode('ASCII', 'ignore').decode('ASCII')
-    return texto.lower().strip()
-
-def guardar_google(hoja_nombre, datos_lista):
-    try:
-        sheet = conectar_google()
-        try:
-            worksheet = sheet.worksheet(hoja_nombre)
-        except:
-            worksheet = sheet.get_worksheet(0)
-            
-        worksheet.append_row(datos_lista)
-        return True
-    except Exception as e:
-        logging.error(f"Error guardando en Google: {e}")
-        return False
-
-def procesar_inteligencia(texto_transcrito):
-    prompt = f"""
-    Actúa como un asistente contable experto en Colombia.
-    Analiza el texto del usuario y extrae una transacción financiera.
-    
-    TEXTO: "{texto_transcrito}"
-
-    REGLAS CRÍTICAS DE INTERPRETACIÓN:
-    1. **MONEDA Y NÚMEROS:**
-       - Estamos en Colombia. Si el monto es pequeño (ej: "280", "31", o menor a 1000) y el contexto es muebles, madera o compras grandes, INTERPRETA MILES (280 -> 280000).
-       - Si el contexto es comida barata o dulces, mantén el valor bajo (ej: "Dulce 2000" -> 2000).
-       - El monto final debe ser un NÚMERO ENTERO SIN PUNTOS NI COMAS (Ej: 280000, no 280.000).
-    
-    2. **FACTURAS:**
-       - Si escuchas números sueltos asociados a "factura", siempre son numeros de 4 digitos para la factura (ej: "tres uno cinco siete"), ÚNELOS (3157).
-       - Extrae el número de la factura en su propio campo. Si no hay, pon "NA".
-
-    3. **CLASIFICACIÓN (PROHIBIDO USAR NOTA):**
-       - Palabras clave como: "Pago", "Compra", "Gasto", "Abono", "Saldo", "Venta", "Cobro" -> SON SIEMPRE TRANSACCIONES (Ingreso o Gasto). JAMÁS las marques como 'NOTA'.
-       - "Abono" o "Saldo" -> TIPO: Ingreso.
-       - "Pago celular" -> GASTO, Hogar, Servicios.
-       - "Matrícula" -> GASTO, Hogar, Educación.
-
-    4. **CATEGORÍAS:**
-       - Ingresos: [{CAT_INGRESOS}]
-       - Gastos Hogar: [{CAT_GASTOS_HOGAR}]
-       - Gastos Fabrica: [{CAT_GASTOS_FABRICA}]
-       - Si no encaja, busca la más lógica. NO uses "Otros" si puedes evitarlo.
-
-    FORMATO DE RESPUESTA OBLIGATORIO (Separado por |):
-    TIPO|CONTEXTO|CATEGORIA|MONTO_ENTERO|DESCRIPCION|NUMERO_FACTURA
-
-    Ejemplos de entrenamiento:
-    Input: "Compra de madera por 280 factura tres uno cinco siete"
-    Output: GASTO|FABRICA|MATERIALES|280000|compra de madera|3157
-
-    Input: "Pago matrícula sofia 3500000"
-    Output: GASTO|HOGAR|EDUCACION|3500000|pago matricula sofia|NA
-    
-    Input: "Ingreso fabrica 500 abono silleteria factura trenta y cinco doce"
-    Output: INGRESO|FABRICA|SILLETERIA|500000|abono silleteria|3512
-    
-    Input: "Nota corregir el valor anterior"
-    Output: NOTA|corregir el valor anterior
-    """
-    
-    response = client_openai.chat.completions.create(
-        model="gpt-4o",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.0 # Temperatura 0 para máxima precisión y menos creatividad
-    )
-    
-    return response.choices[0].message.content.strip().replace('"', '')
-
-async def manejar_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    archivo_local = f"audio_{user_id}.ogg"
-
-    try:
-        await update.message.reply_text("🎧 Procesando...")
-        voice_file = await context.bot.get_file(update.message.voice.file_id)
-        await voice_file.download_to_drive(archivo_local)
-
-        # 1. Transcribir
-        with open(archivo_local, "rb") as audio:
-            transcription = client_openai.audio.transcriptions.create(
-                model="whisper-1", file=audio, language="es"
+    def transcribir(self, ruta_audio):
+        with open(ruta_audio, "rb") as audio:
+            respuesta = self.client.audio.transcriptions.create(
+                model=MODELO_TRANSCRIPCION,
+                file=audio,
+                language="es",
+                response_format="json",
             )
-        texto_usuario = transcription.text
-        print(f"Texto escuchado: {texto_usuario}")
+        return respuesta.text
 
-        # 2. Interpretar
-        respuesta_ia = procesar_inteligencia(texto_usuario)
-        print(f"Respuesta IA: {respuesta_ia}")
-        
-        partes = respuesta_ia.split('|')
+    def interpretar(self, transcripcion, fecha_mensaje):
+        entrada = json.dumps(
+            {
+                "fecha_mensaje": fecha_mensaje,
+                "transcripcion": transcripcion,
+                "categorias_permitidas": sorted(CATEGORIAS_FINANCIERAS_V1),
+            },
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        )
+        respuesta = self.client.responses.create(
+            model=MODELO_INTERPRETACION,
+            instructions=INSTRUCCIONES_INTERPRETACION,
+            input=entrada,
+            reasoning={"effort": "low"},
+            text={
+                "format": {
+                    "type": "json_schema",
+                    "name": "movimiento_financiero_guivaltex_v1",
+                    "description": "Interpretacion financiera estricta para Guivaltex.",
+                    "strict": True,
+                    "schema": CONTRATO_INTERPRETACION,
+                }
+            },
+            max_output_tokens=1500,
+            store=False,
+        )
+        return respuesta.output_text
 
-        # Manejo de NOTAS
-        if partes[0] == "NOTA":
-            guardar_google("Notas", [obtener_fecha_colombia(), partes[1]])
-            await update.message.reply_text(f"📝 Nota guardada:\n{partes[1]}")
+
+class RuntimeTelegram:
+    def __init__(self, autorizacion, procesador):
+        self.autorizacion = autorizacion
+        self.procesador = procesador
+
+    @staticmethod
+    def evento(update):
+        return EventoTelegram.crear(
+            update.effective_chat.id,
+            update.effective_message.message_id,
+            update.effective_user.id,
+            update.effective_message.voice.file_id,
+            update.effective_message.voice.file_unique_id,
+            update.effective_message.date,
+        )
+
+    @staticmethod
+    def descargar_factory(bot, evento):
+        async def descargar(ruta):
+            archivo = await bot.get_file(evento.file_id)
+            await archivo.download_to_drive(ruta)
+        return descargar
+
+    async def manejar_audio(self, update, context):
+        chat_id = update.effective_chat.id
+        user_id = update.effective_user.id
+        if not self.autorizacion.permite(chat_id, user_id):
+            await update.effective_message.reply_text("⛔ Usuario o chat no autorizado.")
+            return
+        try:
+            evento = self.evento(update)
+        except Exception:
+            await update.effective_message.reply_text("❌ El audio no tiene una identidad válida.")
             return
 
-        # Manejo de TRANSACCIONES
-        # Formato esperado: TIPO|CONTEXTO|CATEGORIA|MONTO|DESCRIPCION|FACTURA
-        if len(partes) >= 6:
-            tipo = normalizar_texto(partes[0]).upper()
-            contexto = normalizar_texto(partes[1])
-            categoria = normalizar_texto(partes[2])
-            monto = partes[3] # Debería ser solo números gracias al prompt
-            descripcion = normalizar_texto(partes[4])
-            factura = partes[5] if partes[5] != "NA" else ""
-
-            datos = [
-                obtener_fecha_colombia(),
-                tipo,
-                contexto,
-                categoria,
-                monto,
-                descripcion,
-                factura
-            ]
-            
-            exito = guardar_google("Registros", datos)
-            
-            if exito:
-                msj_factura = f"\n📄 Factura: {factura}" if factura else ""
-                await update.message.reply_text(
-                    f"✅ **{tipo} REGISTRADO**\n"
-                    f"💰 ${monto}\n"
-                    f"📂 {contexto} - {categoria}\n"
-                    f"📝 {descripcion}"
-                    f"{msj_factura}"
-                )
-            else:
-                await update.message.reply_text("❌ Error guardando en Drive.")
+        resultado = await self.procesador.procesar(
+            evento,
+            self.descargar_factory(context.bot, evento),
+        )
+        LOGGER.info(
+            "evento=%s estado=%s codigo=%s repetido=%s",
+            resultado.external_id,
+            resultado.estado,
+            resultado.codigo,
+            resultado.repetido,
+        )
+        mensajes = {
+            "listo": "✅ Movimiento conservado y listo para sincronizar.",
+            "excepcion": "⚠️ Evento conservado; requiere revisión antes de sincronizar.",
+            "recibido": "⏳ Evento conservado. El procesamiento podrá reintentarse.",
+        }
+        if resultado.codigo == "conflicto_identidad":
+            texto = "❌ Conflicto de identidad del mensaje. Requiere revisión."
+        elif resultado.estado == "error":
+            texto = "❌ No fue posible confirmar el avance en la cola. Reintenta el mismo mensaje."
+        elif resultado.codigo == "ya_procesado":
+            texto = "ℹ️ Este mensaje ya estaba registrado; no se creó otra fila."
         else:
-            await update.message.reply_text(f"⚠️ La IA no pudo estructurar el dato: {respuesta_ia}")
+            texto = mensajes.get(resultado.estado, "Evento recibido.")
+        await update.effective_message.reply_text(
+            texto + "\nID: " + resultado.external_id
+        )
 
-    except Exception as e:
-        logging.error(f"Error: {e}")
-        await update.message.reply_text(f"❌ Error: {str(e)}")
-    finally:
-        if os.path.exists(archivo_local):
-            os.remove(archivo_local)
+    async def recuperar(self, application):
+        def factory(evento):
+            return self.descargar_factory(application.bot, evento)
 
-if __name__ == '__main__':
-    keep_alive()
-    application = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-    application.add_handler(MessageHandler(filters.VOICE, manejar_audio))
-    print("🤖 BOT COLOMBIA ACTIVO")
-    application.run_polling()
+        resultados = await self.procesador.recuperar_pendientes(
+            self.autorizacion,
+            factory,
+        )
+        for resultado in resultados:
+            LOGGER.info(
+                "recuperacion evento=%s estado=%s codigo=%s",
+                resultado.external_id,
+                resultado.estado,
+                resultado.codigo,
+            )
+
+
+def iniciar_servidor_api(cola, secreto):
+    servidor = crear_servidor(
+        cola, secreto, port=int(os.environ.get("PORT", "8080"))
+    )
+    threading.Thread(target=servidor.serve_forever, daemon=True).start()
+    return servidor
+
+
+def inspeccionar_cli():
+    resultado = inspeccionar_spreadsheet()
+    print(json.dumps(resultado, ensure_ascii=False, indent=2, sort_keys=True))
+
+
+def preparar_cli():
+    resultado = preparar_spreadsheet()
+    print(json.dumps(resultado, ensure_ascii=False, indent=2, sort_keys=True))
+
+
+def ejecutar_bot():
+    from telegram.ext import ApplicationBuilder, MessageHandler, filters
+
+    token = _variable_requerida("TELEGRAM_TOKEN")
+    api_key = _variable_requerida("OPENAI_API_KEY")
+    secreto_sincronizacion = _variable_requerida(
+        "GUIVALTEX_SYNC_SHARED_SECRET"
+    )
+    autorizacion = AutorizacionTelegram.desde_entorno()
+    cola = conectar_cola()
+    servicios = ServiciosOpenAI(api_key)
+    runtime = RuntimeTelegram(
+        autorizacion,
+        ProcesadorCola(cola, servicios.transcribir, servicios.interpretar),
+    )
+
+    async def post_init(application):
+        await runtime.recuperar(application)
+
+    application = (
+        ApplicationBuilder()
+        .token(token)
+        .concurrent_updates(False)
+        .post_init(post_init)
+        .build()
+    )
+    application.add_handler(MessageHandler(filters.VOICE, runtime.manejar_audio))
+    iniciar_servidor_api(cola, secreto_sincronizacion)
+    LOGGER.info(
+        "Bot iniciado transcripcion=%s interpretacion=%s cola=Cola_Guivaltex_V1",
+        MODELO_TRANSCRIPCION,
+        MODELO_INTERPRETACION,
+    )
+    application.run_polling(drop_pending_updates=False)
+
+
+def main():
+    comando = sys.argv[1] if len(sys.argv) > 1 else "bot"
+    if comando == "inspeccionar-sheet":
+        inspeccionar_cli()
+    elif comando == "preparar-sheet":
+        preparar_cli()
+    elif comando == "bot":
+        ejecutar_bot()
+    else:
+        raise SystemExit(
+            "Uso: python bot.py [bot|inspeccionar-sheet|preparar-sheet]"
+        )
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,4 @@
+google-auth==2.57.0
+gspread==6.2.1
+openai==3.6.0
+python-telegram-bot==22.8
