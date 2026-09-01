@@ -9,6 +9,7 @@ import os
 import re
 import tempfile
 import threading
+import unicodedata
 
 from finanzas import (
     ErrorFinanzas, ErrorRevisionImporte, importe_a_centavos,
@@ -67,15 +68,11 @@ CONTRATO_INTERPRETACION = {
     "required": list(CAMPOS_INTERPRETACION),
 }
 COLUMNAS_COLA = (
-    "schema_version", "external_id", "recepcion_sha256", "chat_id", "message_id",
-    "user_id", "file_id", "file_unique_id", "fecha_mensaje",
-    "transcripcion_original", "payload_json", "payload_sha256", "clase", "tipo",
-    "importe_centavos", "fecha_efectiva", "concepto", "ambito",
-    "categoria_codigo", "factura_id", "requiere_revision",
-    "motivos_revision_json", "evidencia_importe", "estado", "error_codigo",
-    "error_detalle", "intentos", "creado_en", "actualizado_en",
-    "procesamiento_iniciado_en", "procesado_en", "sincronizacion_estado",
-    "sincronizado_en", "transcripcion_modelo", "interpretacion_modelo",
+    "external_id", "fecha_mensaje", "recuperacion_json",
+    "transcripcion_original", "payload_json", "payload_sha256", "tipo",
+    "importe_cop", "fecha_efectiva", "concepto", "ambito",
+    "categoria_codigo", "factura_id", "estado", "motivo_revision",
+    "sincronizacion_estado", "sincronizado_en",
 )
 
 
@@ -152,13 +149,12 @@ class EventoTelegram:
         return crear_external_id(self.chat_id, self.message_id)
 
     @property
-    def recepcion_sha256(self):
-        return sha256_texto(json_canonico({
-            "chat_id": self.chat_id, "message_id": self.message_id,
-            "user_id": self.user_id, "file_id": self.file_id,
+    def recuperacion_json(self):
+        return json_canonico({
+            "user_id": self.user_id,
+            "file_id": self.file_id,
             "file_unique_id": self.file_unique_id,
-            "fecha_mensaje": self.fecha_mensaje,
-        }))
+        })
 
     @classmethod
     def crear(cls, chat_id, message_id, user_id, file_id, file_unique_id,
@@ -178,11 +174,24 @@ class EventoTelegram:
     def desde_fila(cls, fila):
         try:
             fecha = datetime.fromisoformat(fila["fecha_mensaje"])
-        except (KeyError, TypeError, ValueError):
-            raise ErrorPersistencia("La fila pendiente tiene fecha invalida.")
-        return cls.crear(fila.get("chat_id"), fila.get("message_id"),
-                         fila.get("user_id"), fila.get("file_id"),
-                         fila.get("file_unique_id"), fecha)
+            recuperacion = json.loads(fila["recuperacion_json"])
+            if (not isinstance(recuperacion, dict)
+                    or set(recuperacion) != {
+                        "user_id", "file_id", "file_unique_id"
+                    }):
+                raise ValueError
+            identidad = re.fullmatch(
+                r"telegram:(-?\d+):(\d+)", str(fila["external_id"])
+            )
+            if identidad is None:
+                raise ValueError
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            raise ErrorPersistencia("La fila pendiente no permite recuperacion.")
+        return cls.crear(
+            identidad.group(1), identidad.group(2),
+            recuperacion["user_id"], recuperacion["file_id"],
+            recuperacion["file_unique_id"], fecha,
+        )
 
 
 class AutorizacionTelegram:
@@ -272,6 +281,77 @@ def agregar_motivo(motivos, motivo):
         motivos.append(motivo)
 
 
+_NUMEROS_HASTA_29 = {
+    "un": 1, "uno": 1, "una": 1, "dos": 2, "tres": 3, "cuatro": 4,
+    "cinco": 5, "seis": 6, "siete": 7, "ocho": 8, "nueve": 9,
+    "diez": 10, "once": 11, "doce": 12, "trece": 13, "catorce": 14,
+    "quince": 15, "dieciseis": 16, "diecisiete": 17,
+    "dieciocho": 18, "diecinueve": 19, "veinte": 20,
+    "veintiun": 21, "veintiuno": 21, "veintiuna": 21,
+    "veintidos": 22, "veintitres": 23, "veinticuatro": 24,
+    "veinticinco": 25, "veintiseis": 26, "veintisiete": 27,
+    "veintiocho": 28, "veintinueve": 29,
+}
+_DECENAS = {
+    "treinta": 30, "cuarenta": 40, "cincuenta": 50, "sesenta": 60,
+    "setenta": 70, "ochenta": 80, "noventa": 90,
+}
+_CENTENAS = {
+    "cien": 100, "ciento": 100, "doscientos": 200,
+    "trescientos": 300, "cuatrocientos": 400, "quinientos": 500,
+    "seiscientos": 600, "setecientos": 700, "ochocientos": 800,
+    "novecientos": 900,
+}
+
+
+def _texto_sin_tildes(valor):
+    normalizado = unicodedata.normalize("NFKD", str(valor or "").lower())
+    return " ".join(
+        "".join(c for c in normalizado if not unicodedata.combining(c)).split()
+    )
+
+
+def _numero_espanol_hasta_999(texto):
+    partes = [p for p in _texto_sin_tildes(texto).split() if p != "y"]
+    if not partes:
+        return None
+    total = 0
+    if partes[0] in _CENTENAS:
+        centena = partes.pop(0)
+        if centena == "cien" and partes:
+            return None
+        total += _CENTENAS[centena]
+    if not partes:
+        return total or None
+    if len(partes) == 1 and partes[0] in _NUMEROS_HASTA_29:
+        total += _NUMEROS_HASTA_29[partes[0]]
+    elif (len(partes) == 1 and partes[0] in _DECENAS):
+        total += _DECENAS[partes[0]]
+    elif (len(partes) == 2 and partes[0] in _DECENAS
+          and partes[1] in _NUMEROS_HASTA_29
+          and _NUMEROS_HASTA_29[partes[1]] < 10):
+        total += _DECENAS[partes[0]] + _NUMEROS_HASTA_29[partes[1]]
+    else:
+        return None
+    return total if 0 < total <= 999 else None
+
+
+def normalizar_evidencia_importe(evidencia):
+    try:
+        return normalizar_importe_hablado(evidencia)
+    except ErrorRevisionImporte as error_original:
+        texto = _texto_sin_tildes(evidencia)
+        coincidencia = re.fullmatch(
+            r"([a-zñ ]+?) mil(?: (?:peso|pesos|cop))?", texto
+        )
+        if coincidencia is None:
+            raise error_original
+        numero = _numero_espanol_hasta_999(coincidencia.group(1))
+        if numero is None:
+            raise error_original
+        return Decimal(numero * 1000)
+
+
 def validar_interpretacion(external_id, respuesta):
     if isinstance(respuesta, str):
         try:
@@ -285,16 +365,25 @@ def validar_interpretacion(external_id, respuesta):
     concepto, ambito = texto_opcional(datos["concepto"]), texto_opcional(datos["ambito"])
     categoria, factura_id = texto_opcional(datos["categoria"]), texto_opcional(datos["factura_id"])
     evidencia = texto_opcional(datos["evidencia_importe"])
+    regla_categoria = CATEGORIAS_FINANCIERAS_V1.get(categoria)
+    ambito_inferido = (ambito is None and regla_categoria is not None
+                       and regla_categoria[1] in ("empresa", "hogar"))
+    if ambito_inferido:
+        ambito = regla_categoria[1]
+
     motivos = []
     if datos["requiere_revision"]:
         for motivo in datos["motivos_revision"]:
+            if ambito_inferido and "ambito" in _texto_sin_tildes(motivo):
+                continue
             agregar_motivo(motivos, motivo)
-        if not motivos:
+        if not motivos and not ambito_inferido:
             agregar_motivo(motivos, "ia_requiere_revision")
     if clase == "nota":
         agregar_motivo(motivos, "nota_no_financiera")
     if clase == "posible_abono":
         agregar_motivo(motivos, "posible_abono_canonico")
+
     if tipo not in ("ingreso", "gasto"):
         agregar_motivo(motivos, "tipo_invalido")
     if ambito not in ("empresa", "hogar"):
@@ -302,7 +391,6 @@ def validar_interpretacion(external_id, respuesta):
     if not concepto or len(concepto) > 500:
         agregar_motivo(motivos, "concepto_invalido")
 
-    regla_categoria = CATEGORIAS_FINANCIERAS_V1.get(categoria)
     if regla_categoria is None:
         agregar_motivo(motivos, "categoria_invalida")
     else:
@@ -329,7 +417,7 @@ def validar_interpretacion(external_id, respuesta):
         agregar_motivo(motivos, "evidencia_importe_ausente")
     if importe and evidencia:
         try:
-            centavos_evidencia = importe_a_centavos(normalizar_importe_hablado(evidencia))
+            centavos_evidencia = importe_a_centavos(normalizar_evidencia_importe(evidencia))
             propuesto = Decimal(importe)
             if not propuesto.is_finite():
                 raise InvalidOperation
@@ -416,6 +504,13 @@ def valor_celda(valor):
     return str(valor)
 
 
+def importe_cop_celda(centavos):
+    if centavos is None:
+        return ""
+    centavos = int(centavos)
+    pesos, fraccion = divmod(centavos, 100)
+    return str(pesos) if fraccion == 0 else "{0}.{1:02d}".format(pesos, fraccion)
+
 def columna_a1(numero):
     resultado = ""
     while numero:
@@ -468,22 +563,19 @@ class GoogleSheetsQueue:
             self.verificar_encabezado()
             previa = self.buscar(evento.external_id)
             if previa:
-                if previa["recepcion_sha256"] != evento.recepcion_sha256:
-                    raise ConflictoIdentidad("external_id repetido con contenido incompatible.")
+                if (previa["fecha_mensaje"] != evento.fecha_mensaje
+                        or previa["recuperacion_json"] != evento.recuperacion_json):
+                    raise ConflictoIdentidad(
+                        "external_id repetido con contenido incompatible."
+                    )
                 return previa, True
-            ahora = ahora_utc()
             fila = fila_vacia()
             fila.update({
-                "schema_version": SCHEMA_VERSION, "external_id": evento.external_id,
-                "recepcion_sha256": evento.recepcion_sha256,
-                "chat_id": evento.chat_id, "message_id": evento.message_id,
-                "user_id": evento.user_id, "file_id": evento.file_id,
-                "file_unique_id": evento.file_unique_id,
-                "fecha_mensaje": evento.fecha_mensaje, "estado": "recibido",
-                "intentos": "0", "creado_en": ahora, "actualizado_en": ahora,
+                "external_id": evento.external_id,
+                "fecha_mensaje": evento.fecha_mensaje,
+                "recuperacion_json": evento.recuperacion_json,
+                "estado": "recibido",
                 "sincronizacion_estado": "pendiente",
-                "transcripcion_modelo": MODELO_TRANSCRIPCION,
-                "interpretacion_modelo": MODELO_INTERPRETACION,
             })
             self.worksheet.append_row(
                 [valor_celda(fila[c]) for c in COLUMNAS_COLA],
@@ -501,16 +593,7 @@ class GoogleSheetsQueue:
                 raise ErrorPersistencia("La recepcion no existe.")
             if fila["estado"] in ESTADOS_TERMINALES:
                 return fila
-            try:
-                intentos = int(fila.get("intentos") or "0") + 1
-            except ValueError:
-                raise ErrorPersistencia("El contador de intentos es invalido.")
-            ahora = ahora_utc()
-            fila.update({
-                "estado": "procesando", "intentos": str(intentos),
-                "procesamiento_iniciado_en": ahora, "actualizado_en": ahora,
-                "error_codigo": "", "error_detalle": "",
-            })
+            fila.update({"estado": "procesando", "motivo_revision": ""})
             return self.guardar(fila)
 
     def guardar_transcripcion(self, external_id, transcripcion):
@@ -519,7 +602,6 @@ class GoogleSheetsQueue:
             if fila is None:
                 raise ErrorPersistencia("La recepcion no existe.")
             fila["transcripcion_original"] = transcripcion
-            fila["actualizado_en"] = ahora_utc()
             return self.guardar(fila)
 
     def finalizar(self, external_id, resultado):
@@ -527,22 +609,18 @@ class GoogleSheetsQueue:
             fila = self.buscar(external_id)
             if fila is None:
                 raise ErrorPersistencia("La recepcion no existe.")
-            ahora = ahora_utc()
             fila.update({
                 "payload_json": resultado.payload_json,
                 "payload_sha256": resultado.payload_sha256,
-                "clase": resultado.clase, "tipo": resultado.tipo,
-                "importe_centavos": resultado.importe_centavos,
+                "tipo": resultado.tipo,
+                "importe_cop": importe_cop_celda(resultado.importe_centavos),
                 "fecha_efectiva": resultado.fecha_efectiva,
-                "concepto": resultado.concepto, "ambito": resultado.ambito,
+                "concepto": resultado.concepto,
+                "ambito": resultado.ambito,
                 "categoria_codigo": resultado.categoria_codigo,
                 "factura_id": resultado.factura_id,
-                "requiere_revision": resultado.requiere_revision,
-                "motivos_revision_json": json_canonico(list(resultado.motivos_revision)),
-                "evidencia_importe": resultado.evidencia_importe,
-                "estado": resultado.estado, "error_codigo": resultado.error_codigo,
-                "error_detalle": resultado.error_detalle,
-                "actualizado_en": ahora, "procesado_en": ahora,
+                "estado": resultado.estado,
+                "motivo_revision": ", ".join(resultado.motivos_revision),
             })
             return self.guardar(fila)
 
@@ -552,8 +630,8 @@ class GoogleSheetsQueue:
             if fila is None:
                 raise ErrorPersistencia("La recepcion no existe.")
             fila.update({
-                "estado": "recibido", "error_codigo": codigo,
-                "error_detalle": detalle, "actualizado_en": ahora_utc(),
+                "estado": "recibido",
+                "motivo_revision": str(codigo or "").strip(),
             })
             return self.guardar(fila)
 
@@ -562,7 +640,6 @@ class GoogleSheetsQueue:
             self.verificar_encabezado()
             return [f for f in self.todas_las_filas()
                     if f["estado"] in ESTADOS_REANUDABLES]
-
     def entrega_sincronizacion(self):
         """Entrega terminales pendientes; una fila corrupta no bloquea las demas."""
         with self._lock:
@@ -580,12 +657,16 @@ class GoogleSheetsQueue:
                     payload = json.loads(payload_json)
                     if not isinstance(payload, dict):
                         raise ErrorPersistencia("Payload externo invalido.")
+                    motivos = payload.get("motivos_revision")
+                    codigo = (motivos[0] if isinstance(motivos, list)
+                              and motivos and isinstance(motivos[0], str)
+                              else None)
                     registros.append({
                         "external_id": fila["external_id"],
                         "payload": payload,
                         "payload_sha256": fila["payload_sha256"],
                         "estado": fila["estado"],
-                        "error_codigo": fila["error_codigo"] or None,
+                        "error_codigo": codigo,
                         "transcripcion_original":
                             fila["transcripcion_original"] or None,
                     })
@@ -636,10 +717,9 @@ class GoogleSheetsQueue:
                             "estado": "ya_sincronizado", "codigo": "",
                         })
                         continue
-                    ahora = ahora_utc()
                     fila.update({
                         "sincronizacion_estado": "sincronizado",
-                        "sincronizado_en": ahora, "actualizado_en": ahora,
+                        "sincronizado_en": ahora_utc(),
                     })
                     self.guardar(fila)
                     resultados.append({
