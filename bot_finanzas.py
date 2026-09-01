@@ -18,8 +18,21 @@ from finanzas import (
 
 SCHEMA_VERSION = "1"
 NOMBRE_COLA = "Cola_Guivaltex_V1"
-MODELO_TRANSCRIPCION = "gpt-4o-transcribe"
+MODELO_TRANSCRIPCION = "gpt-transcribe"
 MODELO_INTERPRETACION = "gpt-5.6-terra"
+IDIOMAS_TRANSCRIPCION = ("es",)
+PALABRAS_CLAVE_TRANSCRIPCION = (
+    "Guivaltex", "muebles", "botón", "botones", "Cherosky", "tela",
+    "madera", "espuma", "materiales", "transporte", "acarreo", "sillas",
+    "tintos", "desayunos", "onces", "refrigerios", "base cama",
+    "espaldar", "sofá", "colchón", "silletería", "refacción",
+)
+CONTEXTO_TRANSCRIPCION = (
+    "Audio breve en español de Colombia para registrar movimientos de "
+    "Guivaltex, una fábrica de muebles. Transcribe únicamente lo dicho, "
+    "respetando nombres propios y vocabulario del negocio; no completes ni "
+    "inventes palabras."
+)
 ESTADOS_TERMINALES = ("listo", "excepcion")
 ESTADOS_REANUDABLES = ("recibido", "procesando")
 
@@ -29,7 +42,7 @@ CATEGORIAS_FINANCIERAS_V1 = {
     "espaldar": ("ingreso", "empresa"), "sofa": ("ingreso", "empresa"),
     "mesas": ("ingreso", "empresa"), "colchon": ("ingreso", "empresa"),
     "silleteria": ("ingreso", "empresa"), "refaccion": ("ingreso", "empresa"),
-    "comida": ("gasto", "hogar"), "transporte": ("gasto", "hogar"),
+    "comida": ("gasto", "hogar"), "transporte": ("gasto", None),
     "diversion": ("gasto", "hogar"), "dulce": ("gasto", "hogar"),
     "salidas": ("gasto", "hogar"), "salud": ("gasto", "hogar"),
     "vivienda": ("gasto", "hogar"), "servicios_hogar": ("gasto", "hogar"),
@@ -311,6 +324,17 @@ def _texto_sin_tildes(valor):
     )
 
 
+def campos_explicitos_transcripcion(transcripcion):
+    """Lee solo el prefijo estructurado; no interpreta palabras del concepto."""
+    tokens = re.findall(r"[a-z0-9]+", _texto_sin_tildes(transcripcion))
+    tipo = tokens[0] if tokens and tokens[0] in ("ingreso", "gasto") else None
+    posicion_ambito = 1 if tipo is not None else 0
+    ambito = (tokens[posicion_ambito]
+              if len(tokens) > posicion_ambito
+              and tokens[posicion_ambito] in ("empresa", "hogar") else None)
+    return {"tipo": tipo, "ambito": ambito}
+
+
 def _numero_espanol_hasta_999(texto):
     partes = [p for p in _texto_sin_tildes(texto).split() if p != "y"]
     if not partes:
@@ -352,7 +376,33 @@ def normalizar_evidencia_importe(evidencia):
         return Decimal(numero * 1000)
 
 
-def validar_interpretacion(external_id, respuesta):
+_REFRIGERIO_OPERATIVO = re.compile(
+    r"\b(?:tinto|tintos|onces|refrigerio|refrigerios)\b"
+)
+_ALIMENTACION_HOGAR = re.compile(
+    r"\b(?:desayuno|desayunos|almuerzo|almuerzos|comida|comidas|cena|cenas)\b"
+)
+_CATEGORIAS_ALIMENTACION = frozenset(("comida", "onces", "otros_gastos"))
+
+
+def normalizar_alimentacion(tipo, categoria, ambito, concepto,
+                           ambito_explicito, transcripcion=None):
+    """Aplica ámbito explícito primero y reglas sobre el audio original."""
+    if tipo != "gasto" or categoria not in _CATEGORIAS_ALIMENTACION:
+        return categoria, ambito
+    texto = _texto_sin_tildes(transcripcion or concepto)
+    es_refrigerio = _REFRIGERIO_OPERATIVO.search(texto) is not None
+    es_comida = _ALIMENTACION_HOGAR.search(texto) is not None
+    if not (es_refrigerio or es_comida):
+        return categoria, ambito
+    if ambito_explicito:
+        return ("onces" if ambito == "empresa" else "comida"), ambito
+    if es_refrigerio:
+        return "onces", "empresa"
+    return "comida", "hogar"
+
+
+def validar_interpretacion(external_id, respuesta, transcripcion=None):
     if isinstance(respuesta, str):
         try:
             respuesta = json.loads(respuesta)
@@ -365,19 +415,42 @@ def validar_interpretacion(external_id, respuesta):
     concepto, ambito = texto_opcional(datos["concepto"]), texto_opcional(datos["ambito"])
     categoria, factura_id = texto_opcional(datos["categoria"]), texto_opcional(datos["factura_id"])
     evidencia = texto_opcional(datos["evidencia_importe"])
+    explicitos = campos_explicitos_transcripcion(transcripcion)
+    tipo_explicito = explicitos["tipo"] is not None
+    ambito_explicito = explicitos["ambito"] is not None
+    if tipo_explicito:
+        tipo = explicitos["tipo"]
+    if ambito_explicito:
+        ambito = explicitos["ambito"]
+
+    categoria_original, ambito_previo = categoria, ambito
+    categoria, ambito = normalizar_alimentacion(
+        tipo, categoria, ambito, concepto, ambito_explicito, transcripcion
+    )
+    categoria_inferida = categoria != categoria_original
+    ambito_inferido_regla = ambito != ambito_previo
     regla_categoria = CATEGORIAS_FINANCIERAS_V1.get(categoria)
-    ambito_inferido = (ambito is None and regla_categoria is not None
-                       and regla_categoria[1] in ("empresa", "hogar"))
-    if ambito_inferido:
+    ambito_inferido_categoria = (
+        ambito is None and regla_categoria is not None
+        and regla_categoria[1] in ("empresa", "hogar")
+    )
+    if ambito_inferido_categoria:
         ambito = regla_categoria[1]
+    ambito_resuelto = (ambito_explicito or ambito_inferido_regla
+                       or ambito_inferido_categoria)
 
     motivos = []
     if datos["requiere_revision"]:
         for motivo in datos["motivos_revision"]:
-            if ambito_inferido and "ambito" in _texto_sin_tildes(motivo):
+            motivo_normalizado = _texto_sin_tildes(motivo)
+            if ((tipo_explicito and "tipo" in motivo_normalizado)
+                    or (ambito_resuelto and "ambito" in motivo_normalizado)
+                    or (categoria_inferida
+                        and "categoria" in motivo_normalizado)):
                 continue
             agregar_motivo(motivos, motivo)
-        if not motivos and not ambito_inferido:
+        if not motivos and not (tipo_explicito or ambito_resuelto
+                                or categoria_inferida):
             agregar_motivo(motivos, "ia_requiere_revision")
     if clase == "nota":
         agregar_motivo(motivos, "nota_no_financiera")
@@ -640,6 +713,7 @@ class GoogleSheetsQueue:
             self.verificar_encabezado()
             return [f for f in self.todas_las_filas()
                     if f["estado"] in ESTADOS_REANUDABLES]
+
     def entrega_sincronizacion(self):
         """Entrega terminales pendientes; una fila corrupta no bloquea las demas."""
         with self._lock:
@@ -888,7 +962,9 @@ class ProcesadorCola:
                 return ResultadoProceso(evento.external_id, "recibido",
                                         "interpretacion_fallida", repetido)
             try:
-                resultado = validar_interpretacion(evento.external_id, respuesta)
+                resultado = validar_interpretacion(
+                    evento.external_id, respuesta, transcripcion
+                )
             except ErrorContrato:
                 resultado = excepcion_contrato(evento.external_id, respuesta)
             try:

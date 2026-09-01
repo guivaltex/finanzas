@@ -9,10 +9,14 @@ from render_finanzas_api import crear_servidor
 from bot_finanzas import (
     AutorizacionTelegram,
     CATEGORIAS_FINANCIERAS_V1,
+    CONTEXTO_TRANSCRIPCION,
+    campos_explicitos_transcripcion,
     CONTRATO_INTERPRETACION,
     EventoTelegram,
+    IDIOMAS_TRANSCRIPCION,
     MODELO_INTERPRETACION,
     MODELO_TRANSCRIPCION,
+    PALABRAS_CLAVE_TRANSCRIPCION,
     ProcesadorCola,
     conectar_cola,
     inspeccionar_spreadsheet,
@@ -31,6 +35,11 @@ Interpreta una transcripcion financiera de Guivaltex en Colombia.
 Devuelve exclusivamente el objeto del JSON Schema estricto.
 
 Reglas:
+- Jerarquia obligatoria: primero campos pronunciados explicitamente; despues
+  reglas deterministas; luego inferencia semantica; finalmente revision.
+- La entrada incluye campos_explicitos detectados del prefijo habitual
+  tipo -> ambito. Si tipo o ambito no son null, copialos exactamente al JSON:
+  ninguna palabra del concepto puede sobrescribirlos.
 - clase=movimiento para gastos/ingresos externos normales.
 - clase=posible_abono para abonos, saldos o cobros que deben registrarse
   canonicamente desde el modulo Abonos de Guivaltex.
@@ -44,6 +53,12 @@ Reglas:
 - No hay movimientos finales validos inferiores a COP 1000.
 - fecha_efectiva usa YYYY-MM-DD. Resuelve fechas relativas usando fecha_mensaje.
 - categoria debe ser exactamente una de las categorias entregadas.
+- Transporte puede ser empresa u hogar. Conserva siempre el ambito explicito;
+  solo infierelo por contexto cuando campos_explicitos.ambito sea null.
+- Con ambito explicito, nunca lo cambies por desayuno, almuerzo, comida, cena,
+  onces, refrigerios, transporte ni ninguna otra palabra del concepto.
+- Sin ambito explicito, desayuno/almuerzo/comida/cena usan comida y hogar como
+  respaldo. Onces/refrigerios/tintos operativos usan onces y empresa.
 - No inventes factura_id. Conserva el identificador solo si fue mencionado.
 - Si falta evidencia, hay ambiguedad o la categoria no es clara, marca
   requiere_revision=true y explica motivos breves mediante codigos estables.
@@ -71,7 +86,11 @@ class ServiciosOpenAI:
             respuesta = self.client.audio.transcriptions.create(
                 model=MODELO_TRANSCRIPCION,
                 file=audio,
-                language="es",
+                prompt=CONTEXTO_TRANSCRIPCION,
+                extra_body={
+                    "keywords": list(PALABRAS_CLAVE_TRANSCRIPCION),
+                    "languages": list(IDIOMAS_TRANSCRIPCION),
+                },
                 response_format="json",
             )
         return respuesta.text
@@ -81,6 +100,9 @@ class ServiciosOpenAI:
             {
                 "fecha_mensaje": fecha_mensaje,
                 "transcripcion": transcripcion,
+                "campos_explicitos": campos_explicitos_transcripcion(
+                    transcripcion
+                ),
                 "categorias_permitidas": sorted(CATEGORIAS_FINANCIERAS_V1),
             },
             ensure_ascii=False,
