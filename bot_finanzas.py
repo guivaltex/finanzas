@@ -20,12 +20,13 @@ SCHEMA_VERSION = "1"
 NOMBRE_COLA = "Cola_Guivaltex_V1"
 MODELO_TRANSCRIPCION = "gpt-transcribe"
 MODELO_INTERPRETACION = "gpt-5.6-terra"
+ESFUERZO_INTERPRETACION = "medium"
 IDIOMAS_TRANSCRIPCION = ("es",)
 PALABRAS_CLAVE_TRANSCRIPCION = (
     "Guivaltex", "muebles", "botón", "botones", "Cherosky", "tela",
     "madera", "espuma", "materiales", "transporte", "acarreo", "sillas",
     "tintos", "desayunos", "onces", "refrigerios", "base cama",
-    "espaldar", "sofá", "colchón", "silletería", "refacción",
+    "espaldar", "sofá", "colchón", "silletería", "melamina",
 )
 CONTEXTO_TRANSCRIPCION = (
     "Audio breve en español de Colombia para registrar movimientos de "
@@ -53,8 +54,50 @@ CATEGORIAS_FINANCIERAS_V1 = {
     "deudas": ("gasto", "empresa"), "herramientas": ("gasto", "empresa"),
     "insumos": ("gasto", "empresa"), "otros_ingresos": ("ingreso", None),
     "otros_gastos": ("gasto", None), "ajuste_caja": (None, None),
+    "jhoana": ("gasto", "hogar"), "guillermo": ("gasto", "hogar"),
 }
 CATEGORIAS_RESERVADAS = frozenset(("abono", "saldo", "sueldos", "ajuste_caja"))
+NOMBRES_CATEGORIAS = {
+    "base_cama": "Base cama", "servicios_hogar": "Servicios del hogar",
+    "servicios_empresa": "Servicios de empresa",
+    "otros_ingresos": "Otros ingresos", "otros_gastos": "Otros gastos",
+    "ajuste_caja": "Ajuste de caja", "jhoana": "Jhoana",
+    "guillermo": "Guillermo",
+}
+SENALES_CATEGORIAS = {
+    "insumos": ("guantes",),
+    "transporte": ("acarreo", "transporte"),
+    "onces": ("tinto", "tintos", "onces", "refrigerio"),
+    "comida": ("desayuno", "almuerzo", "comida", "cena"),
+    "jhoana": ("Jhoana", "Joana", "Jhohana", "Johana", "Johanna"),
+    "guillermo": ("Guillermo", "Memo"),
+}
+CATEGORIAS_INTERPRETACION = tuple(
+    {
+        "codigo": codigo,
+        "tipo_permitido": regla[0],
+        "ambito_permitido": regla[1],
+        "significado": NOMBRES_CATEGORIAS.get(
+            codigo, codigo.replace("_", " ").capitalize()
+        ),
+        "aliases_senales": list(SENALES_CATEGORIAS.get(codigo, ())),
+    }
+    for codigo, regla in sorted(CATEGORIAS_FINANCIERAS_V1.items())
+)
+MOTIVOS_REVISION_PERMITIDOS = frozenset((
+    "ambito_ambiguo", "ambito_invalido", "ambito_omitido",
+    "categoria_ambigua", "categoria_ambito_incompatible",
+    "categoria_invalida", "categoria_reservada_fuente_canonica",
+    "categoria_tipo_incompatible", "concepto_invalido",
+    "contradiccion_datos", "evidencia_importe_ausente",
+    "factura_hogar_incompatible", "factura_invalida",
+    "fecha_efectiva_ausente", "fecha_efectiva_invalida",
+    "fuente_canonica_nomina", "ia_requiere_revision",
+    "importe_ausente", "importe_contradictorio", "importe_invalido",
+    "importe_no_coincide_con_evidencia", "ingreso_factura_requiere_abonos",
+    "nota_no_financiera", "posible_abono_canonico",
+    "tipo_invalido", "transcripcion_insuficiente",
+))
 CAMPOS_INTERPRETACION = (
     "clase", "tipo", "importe", "fecha_efectiva", "concepto", "ambito",
     "categoria", "factura_id", "requiere_revision", "motivos_revision",
@@ -75,7 +118,12 @@ CONTRATO_INTERPRETACION = {
         },
         "factura_id": {"type": ["string", "null"]},
         "requiere_revision": {"type": "boolean"},
-        "motivos_revision": {"type": "array", "items": {"type": "string"}},
+        "motivos_revision": {
+            "type": "array",
+            "items": {
+                "type": "string", "enum": sorted(MOTIVOS_REVISION_PERMITIDOS),
+            },
+        },
         "evidencia_importe": {"type": ["string", "null"]},
     },
     "required": list(CAMPOS_INTERPRETACION),
@@ -264,6 +312,52 @@ class ResultadoProceso:
     estado: str
     codigo: str
     repetido: bool = False
+    tipo: object = None
+    importe_centavos: object = None
+    concepto: object = None
+    ambito: object = None
+    categoria_codigo: object = None
+    motivos_revision: tuple = ()
+
+
+def crear_resultado_proceso(external_id, estado, codigo, repetido=False,
+                            interpretacion=None, fila=None):
+    valores = {
+        "tipo": None, "importe_centavos": None, "concepto": None,
+        "ambito": None, "categoria_codigo": None, "motivos_revision": (),
+    }
+    if interpretacion is not None:
+        valores.update({
+            "tipo": interpretacion.tipo,
+            "importe_centavos": interpretacion.importe_centavos,
+            "concepto": interpretacion.concepto,
+            "ambito": interpretacion.ambito,
+            "categoria_codigo": interpretacion.categoria_codigo,
+            "motivos_revision": interpretacion.motivos_revision,
+        })
+    elif fila is not None:
+        importe_cop = texto_opcional(fila.get("importe_cop"))
+        importe_centavos = None
+        if importe_cop:
+            try:
+                importe_centavos = importe_a_centavos(Decimal(importe_cop))
+            except ErrorFinanzas:
+                pass
+        valores.update({
+            "tipo": texto_opcional(fila.get("tipo")),
+            "importe_centavos": importe_centavos,
+            "concepto": texto_opcional(fila.get("concepto")),
+            "ambito": texto_opcional(fila.get("ambito")),
+            "categoria_codigo": texto_opcional(fila.get("categoria_codigo")),
+            "motivos_revision": tuple(
+                parte.strip()
+                for parte in str(fila.get("motivo_revision") or "").split(",")
+                if parte.strip()
+            ),
+        })
+    return ResultadoProceso(
+        external_id, estado, codigo, repetido=repetido, **valores
+    )
 
 
 def texto_opcional(valor):
@@ -289,7 +383,11 @@ def validar_contrato(datos):
 
 
 def agregar_motivo(motivos, motivo):
-    motivo = str(motivo or "").strip()
+    motivo = re.sub(
+        r"[^a-z0-9]+", "_", _texto_sin_tildes(motivo)
+    ).strip("_")
+    if motivo not in MOTIVOS_REVISION_PERMITIDOS:
+        motivo = "ia_requiere_revision"
     if motivo and motivo not in motivos:
         motivos.append(motivo)
 
@@ -325,13 +423,19 @@ def _texto_sin_tildes(valor):
 
 
 def campos_explicitos_transcripcion(transcripcion):
-    """Lee solo el prefijo estructurado; no interpreta palabras del concepto."""
+    """Reconoce tipo y ámbitos pronunciados, incluida «fábrica»."""
     tokens = re.findall(r"[a-z0-9]+", _texto_sin_tildes(transcripcion))
     tipo = tokens[0] if tokens and tokens[0] in ("ingreso", "gasto") else None
-    posicion_ambito = 1 if tipo is not None else 0
-    ambito = (tokens[posicion_ambito]
-              if len(tokens) > posicion_ambito
-              and tokens[posicion_ambito] in ("empresa", "hogar") else None)
+    posicion = 1 if tipo is not None else 0
+    inmediato = tokens[posicion] if len(tokens) > posicion else None
+    if inmediato in ("empresa", "fabrica", "hogar"):
+        ambito = "empresa" if inmediato in ("empresa", "fabrica") else "hogar"
+    elif any(token in ("empresa", "fabrica") for token in tokens):
+        ambito = "empresa"
+    elif "hogar" in tokens:
+        ambito = "hogar"
+    else:
+        ambito = None
     return {"tipo": tipo, "ambito": ambito}
 
 
@@ -365,15 +469,20 @@ def normalizar_evidencia_importe(evidencia):
         return normalizar_importe_hablado(evidencia)
     except ErrorRevisionImporte as error_original:
         texto = _texto_sin_tildes(evidencia)
+        texto = re.sub(r" (?:peso|pesos|cop)$", "", texto)
         coincidencia = re.fullmatch(
-            r"([a-zñ ]+?) mil(?: (?:peso|pesos|cop))?", texto
+            r"(?P<miles>[a-z ]+?) mil"
+            r"(?: (?P<resto>[a-z ]+?))?",
+            texto,
         )
         if coincidencia is None:
             raise error_original
-        numero = _numero_espanol_hasta_999(coincidencia.group(1))
-        if numero is None:
+        miles = _numero_espanol_hasta_999(coincidencia.group("miles"))
+        resto_texto = coincidencia.group("resto")
+        resto = _numero_espanol_hasta_999(resto_texto) if resto_texto else 0
+        if miles is None or (resto_texto and resto is None):
             raise error_original
-        return Decimal(numero * 1000)
+        return Decimal(miles * 1000 + resto)
 
 
 _REFRIGERIO_OPERATIVO = re.compile(
@@ -383,6 +492,39 @@ _ALIMENTACION_HOGAR = re.compile(
     r"\b(?:desayuno|desayunos|almuerzo|almuerzos|comida|comidas|cena|cenas)\b"
 )
 _CATEGORIAS_ALIMENTACION = frozenset(("comida", "onces", "otros_gastos"))
+_NOMBRE_JHOANA = re.compile(r"\b(?:j|y)h?oh?a?n{1,2}a\b")
+_NOMBRE_GUILLERMO = re.compile(r"\b(?:guillermo|memo)\b")
+_GUANTES = re.compile(r"\bguantes?\b")
+_ACARREO = re.compile(r"\bacarreos?\b")
+_PRESTAMO_NOMINA = re.compile(
+    r"\b(?:prestamo|prestamos|anticipo|anticipos)\b"
+)
+_SUELDO_NOMINA = re.compile(
+    r"\b(?:sueldo|sueldos|salario|salarios|nomina)\b"
+)
+
+
+def normalizar_reglas_negocio(tipo, categoria, ambito, concepto,
+                              transcripcion=None):
+    """Reglas fuertes y auditables anteriores a la inferencia del modelo."""
+    texto = _texto_sin_tildes(transcripcion or concepto)
+    if _NOMBRE_JHOANA.search(texto):
+        return "jhoana", "hogar", True
+    if _NOMBRE_GUILLERMO.search(texto):
+        return "guillermo", "hogar", True
+    if tipo == "gasto" and _GUANTES.search(texto):
+        return "insumos", ambito, True
+    if tipo == "gasto" and _ACARREO.search(texto):
+        return "transporte", ambito, True
+    return categoria, ambito, False
+
+
+def es_fuente_canonica_nomina(concepto, transcripcion=None):
+    texto = _texto_sin_tildes(
+        " ".join(filter(None, (transcripcion, concepto)))
+    )
+    return bool(_PRESTAMO_NOMINA.search(texto)
+                and _SUELDO_NOMINA.search(texto))
 
 
 def normalizar_alimentacion(tipo, categoria, ambito, concepto,
@@ -424,9 +566,20 @@ def validar_interpretacion(external_id, respuesta, transcripcion=None):
         ambito = explicitos["ambito"]
 
     categoria_original, ambito_previo = categoria, ambito
+    categoria, ambito, regla_fuerte = normalizar_reglas_negocio(
+        tipo, categoria, ambito, concepto, transcripcion
+    )
     categoria, ambito = normalizar_alimentacion(
         tipo, categoria, ambito, concepto, ambito_explicito, transcripcion
     )
+    regla_categoria = CATEGORIAS_FINANCIERAS_V1.get(categoria)
+    categoria_incompatible_ia = (
+        regla_categoria is not None and regla_categoria[0] is not None
+        and tipo in ("ingreso", "gasto") and regla_categoria[0] != tipo
+    )
+    if (tipo == "gasto" and not regla_fuerte
+            and (categoria is None or categoria_incompatible_ia)):
+        categoria = "otros_gastos"
     categoria_inferida = categoria != categoria_original
     ambito_inferido_regla = ambito != ambito_previo
     regla_categoria = CATEGORIAS_FINANCIERAS_V1.get(categoria)
@@ -438,6 +591,13 @@ def validar_interpretacion(external_id, respuesta, transcripcion=None):
         ambito = regla_categoria[1]
     ambito_resuelto = (ambito_explicito or ambito_inferido_regla
                        or ambito_inferido_categoria)
+    fallback_otros_gastos = (
+        tipo == "gasto" and categoria == "otros_gastos"
+        and ambito in ("empresa", "hogar") and bool(concepto)
+    )
+    categoria_resuelta = (
+        categoria_inferida or regla_fuerte or fallback_otros_gastos
+    )
 
     motivos = []
     if datos["requiere_revision"]:
@@ -445,17 +605,20 @@ def validar_interpretacion(external_id, respuesta, transcripcion=None):
             motivo_normalizado = _texto_sin_tildes(motivo)
             if ((tipo_explicito and "tipo" in motivo_normalizado)
                     or (ambito_resuelto and "ambito" in motivo_normalizado)
-                    or (categoria_inferida
+                    or (categoria_resuelta
                         and "categoria" in motivo_normalizado)):
                 continue
             agregar_motivo(motivos, motivo)
         if not motivos and not (tipo_explicito or ambito_resuelto
-                                or categoria_inferida):
+                                or categoria_resuelta):
             agregar_motivo(motivos, "ia_requiere_revision")
     if clase == "nota":
         agregar_motivo(motivos, "nota_no_financiera")
     if clase == "posible_abono":
         agregar_motivo(motivos, "posible_abono_canonico")
+    fuente_nomina = es_fuente_canonica_nomina(concepto, transcripcion)
+    if fuente_nomina:
+        agregar_motivo(motivos, "fuente_canonica_nomina")
 
     if tipo not in ("ingreso", "gasto"):
         agregar_motivo(motivos, "tipo_invalido")
@@ -472,7 +635,8 @@ def validar_interpretacion(external_id, respuesta, transcripcion=None):
             agregar_motivo(motivos, "categoria_tipo_incompatible")
         if ambito_categoria is not None and ambito != ambito_categoria:
             agregar_motivo(motivos, "categoria_ambito_incompatible")
-        if categoria in CATEGORIAS_RESERVADAS:
+        if categoria in CATEGORIAS_RESERVADAS and not (
+                fuente_nomina and categoria == "sueldos"):
             agregar_motivo(motivos, "categoria_reservada_fuente_canonica")
 
     if factura_id is not None:
@@ -915,8 +1079,10 @@ class ProcesadorCola:
                 return ResultadoProceso(evento.external_id, "error",
                                         "persistencia_no_disponible")
             if fila["estado"] in ESTADOS_TERMINALES:
-                return ResultadoProceso(evento.external_id, fila["estado"],
-                                        "ya_procesado", True)
+                return crear_resultado_proceso(
+                    evento.external_id, fila["estado"], "ya_procesado", True,
+                    fila=fila,
+                )
             try:
                 fila = await en_hilo(self.cola.iniciar, evento.external_id)
             except Exception:
@@ -970,10 +1136,14 @@ class ProcesadorCola:
             try:
                 await en_hilo(self.cola.finalizar, evento.external_id, resultado)
             except Exception:
-                return ResultadoProceso(evento.external_id, "error",
-                                        "persistencia_no_disponible", repetido)
-            return ResultadoProceso(evento.external_id, resultado.estado,
-                                    "procesado", repetido)
+                return crear_resultado_proceso(
+                    evento.external_id, "error", "persistencia_no_disponible",
+                    repetido, interpretacion=resultado,
+                )
+            return crear_resultado_proceso(
+                evento.external_id, resultado.estado, "procesado", repetido,
+                interpretacion=resultado,
+            )
 
     async def recuperar_pendientes(self, autorizacion, descargar_factory):
         try:

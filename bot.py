@@ -8,14 +8,16 @@ import threading
 from render_finanzas_api import crear_servidor
 from bot_finanzas import (
     AutorizacionTelegram,
-    CATEGORIAS_FINANCIERAS_V1,
+    CATEGORIAS_INTERPRETACION,
     CONTEXTO_TRANSCRIPCION,
     campos_explicitos_transcripcion,
     CONTRATO_INTERPRETACION,
+    ESFUERZO_INTERPRETACION,
     EventoTelegram,
     IDIOMAS_TRANSCRIPCION,
     MODELO_INTERPRETACION,
     MODELO_TRANSCRIPCION,
+    NOMBRES_CATEGORIAS,
     PALABRAS_CLAVE_TRANSCRIPCION,
     ProcesadorCola,
     conectar_cola,
@@ -38,7 +40,8 @@ Reglas:
 - Jerarquia obligatoria: primero campos pronunciados explicitamente; despues
   reglas deterministas; luego inferencia semantica; finalmente revision.
 - La entrada incluye campos_explicitos detectados del prefijo habitual
-  tipo -> ambito. Si tipo o ambito no son null, copialos exactamente al JSON:
+  y de las palabras empresa/fabrica/hogar. Si tipo o ambito no son null,
+  copialos exactamente al JSON:
   ninguna palabra del concepto puede sobrescribirlos.
 - clase=movimiento para gastos/ingresos externos normales.
 - clase=posible_abono para abonos, saldos o cobros que deben registrarse
@@ -53,6 +56,13 @@ Reglas:
 - No hay movimientos finales validos inferiores a COP 1000.
 - fecha_efectiva usa YYYY-MM-DD. Resuelve fechas relativas usando fecha_mensaje.
 - categoria debe ser exactamente una de las categorias entregadas.
+- Cada categoria incluye tipo, ambito, significado y señales. Descarta
+  categorias incompatibles con el tipo o ambito ya resuelto.
+- Guantes es insumos y acarreo es transporte.
+- Los gastos sin categoria especifica fuerte pueden usar otros_gastos.
+- Prestamos o anticipos sobre sueldo requieren fuente_canonica_nomina.
+- Jhoana/Joana/Jhohana y variaciones corresponden a hogar/Jhoana.
+  Guillermo o Memo corresponden a hogar/Guillermo.
 - Transporte puede ser empresa u hogar. Conserva siempre el ambito explicito;
   solo infierelo por contexto cuando campos_explicitos.ambito sea null.
 - Con ambito explicito, nunca lo cambies por desayuno, almuerzo, comida, cena,
@@ -70,6 +80,11 @@ def _variable_requerida(nombre):
     if not valor:
         raise RuntimeError("Falta la variable de entorno " + nombre + ".")
     return valor
+
+
+def telegram_esta_activo(application):
+    updater = application.updater
+    return bool(application.running and updater is not None and updater.running)
 
 
 class ServiciosOpenAI:
@@ -103,7 +118,7 @@ class ServiciosOpenAI:
                 "campos_explicitos": campos_explicitos_transcripcion(
                     transcripcion
                 ),
-                "categorias_permitidas": sorted(CATEGORIAS_FINANCIERAS_V1),
+                "categorias_permitidas": CATEGORIAS_INTERPRETACION,
             },
             ensure_ascii=False,
             allow_nan=False,
@@ -113,7 +128,7 @@ class ServiciosOpenAI:
             model=MODELO_INTERPRETACION,
             instructions=INSTRUCCIONES_INTERPRETACION,
             input=entrada,
-            reasoning={"effort": "low"},
+            reasoning={"effort": ESFUERZO_INTERPRETACION},
             text={
                 "format": {
                     "type": "json_schema",
@@ -152,6 +167,82 @@ class RuntimeTelegram:
             await archivo.download_to_drive(ruta)
         return descargar
 
+    @staticmethod
+    def mensaje_resultado(resultado):
+        motivos_humanos = {
+            "fuente_canonica_nomina":
+                "Registrar desde Nómina/comprobante de pago.",
+            "posible_abono_canonico":
+                "Registrar el pago desde Abonos en Guivaltex.",
+            "importe_contradictorio":
+                "El importe hablado es contradictorio o ambiguo.",
+            "importe_no_coincide_con_evidencia":
+                "El importe no coincide con lo pronunciado.",
+            "categoria_invalida": "La categoría no es válida.",
+            "categoria_tipo_incompatible":
+                "La categoría no corresponde al tipo de movimiento.",
+            "categoria_ambito_incompatible":
+                "La categoría no corresponde al ámbito.",
+            "ambito_invalido": "No fue posible determinar el ámbito.",
+            "concepto_invalido": "No fue posible determinar el concepto.",
+            "contrato_ia_invalido":
+                "No fue posible interpretar el audio con seguridad.",
+        }
+        errores_humanos = {
+            "conflicto_identidad":
+                "El identificador ya existe con otro audio; requiere revisión.",
+            "persistencia_no_disponible":
+                "No fue posible confirmar la cola. Reintenta el mismo mensaje.",
+            "descarga_fallida":
+                "No se pudo descargar el audio. El evento quedó conservado.",
+            "transcripcion_fallida":
+                "No se pudo transcribir el audio. El evento quedó conservado.",
+            "interpretacion_fallida":
+                "No se pudo interpretar el audio. El evento quedó conservado.",
+        }
+        if resultado.estado == "listo":
+            encabezado = "✅ Listo para sincronizar"
+        elif resultado.estado == "excepcion":
+            encabezado = "⚠️ Revisión necesaria"
+        elif resultado.estado == "recibido":
+            encabezado = "⏳ Conservado; reintento pendiente"
+        else:
+            encabezado = "❌ No se pudo completar"
+        if resultado.codigo == "ya_procesado":
+            encabezado = "ℹ️ Mensaje ya procesado\n" + encabezado
+
+        partes = []
+        if resultado.tipo:
+            partes.append(resultado.tipo.capitalize())
+        if resultado.ambito:
+            partes.append(resultado.ambito.capitalize())
+        if resultado.importe_centavos is not None:
+            pesos = resultado.importe_centavos // 100
+            partes.append("$" + format(pesos, ",").replace(",", "."))
+        if resultado.categoria_codigo:
+            partes.append(NOMBRES_CATEGORIAS.get(
+                resultado.categoria_codigo,
+                resultado.categoria_codigo.replace("_", " ").capitalize(),
+            ))
+
+        lineas = [encabezado]
+        if partes:
+            lineas.append(" · ".join(partes))
+        if resultado.concepto:
+            lineas.append(resultado.concepto)
+        motivos = [
+            motivos_humanos.get(
+                motivo, motivo.replace("_", " ").capitalize() + "."
+            )
+            for motivo in resultado.motivos_revision
+        ]
+        if not motivos and resultado.codigo in errores_humanos:
+            motivos.append(errores_humanos[resultado.codigo])
+        if motivos:
+            lineas.append("Motivo: " + " ".join(motivos))
+        lineas.append("ID: " + resultado.external_id)
+        return "\n".join(lineas)
+
     async def manejar_audio(self, update, context):
         chat_id = update.effective_chat.id
         user_id = update.effective_user.id
@@ -175,21 +266,8 @@ class RuntimeTelegram:
             resultado.codigo,
             resultado.repetido,
         )
-        mensajes = {
-            "listo": "✅ Movimiento conservado y listo para sincronizar.",
-            "excepcion": "⚠️ Evento conservado; requiere revisión antes de sincronizar.",
-            "recibido": "⏳ Evento conservado. El procesamiento podrá reintentarse.",
-        }
-        if resultado.codigo == "conflicto_identidad":
-            texto = "❌ Conflicto de identidad del mensaje. Requiere revisión."
-        elif resultado.estado == "error":
-            texto = "❌ No fue posible confirmar el avance en la cola. Reintenta el mismo mensaje."
-        elif resultado.codigo == "ya_procesado":
-            texto = "ℹ️ Este mensaje ya estaba registrado; no se creó otra fila."
-        else:
-            texto = mensajes.get(resultado.estado, "Evento recibido.")
         await update.effective_message.reply_text(
-            texto + "\nID: " + resultado.external_id
+            self.mensaje_resultado(resultado)
         )
 
     async def recuperar(self, application):
@@ -209,9 +287,10 @@ class RuntimeTelegram:
             )
 
 
-def iniciar_servidor_api(cola, secreto):
+def iniciar_servidor_api(cola, secreto, estado_telegram):
     servidor = crear_servidor(
-        cola, secreto, port=int(os.environ.get("PORT", "8080"))
+        cola, secreto, estado_telegram=estado_telegram,
+        port=int(os.environ.get("PORT", "8080"))
     )
     threading.Thread(target=servidor.serve_forever, daemon=True).start()
     return servidor
@@ -246,21 +325,46 @@ def ejecutar_bot():
     async def post_init(application):
         await runtime.recuperar(application)
 
+    async def post_stop(application):
+        LOGGER.info("Polling de Telegram detenido; iniciando cierre.")
+
+    async def post_shutdown(application):
+        LOGGER.info("Runtime de Telegram cerrado.")
+
     application = (
         ApplicationBuilder()
         .token(token)
         .concurrent_updates(False)
         .post_init(post_init)
+        .post_stop(post_stop)
+        .post_shutdown(post_shutdown)
         .build()
     )
     application.add_handler(MessageHandler(filters.VOICE, runtime.manejar_audio))
-    iniciar_servidor_api(cola, secreto_sincronizacion)
+    def telegram_activo():
+        return telegram_esta_activo(application)
+
+    servidor = iniciar_servidor_api(
+        cola, secreto_sincronizacion, telegram_activo
+    )
     LOGGER.info(
-        "Bot iniciado transcripcion=%s interpretacion=%s cola=Cola_Guivaltex_V1",
+        "Iniciando polling transcripcion=%s interpretacion=%s reasoning=%s "
+        "cola=Cola_Guivaltex_V1",
         MODELO_TRANSCRIPCION,
         MODELO_INTERPRETACION,
+        ESFUERZO_INTERPRETACION,
     )
-    application.run_polling(drop_pending_updates=False)
+    try:
+        application.run_polling(drop_pending_updates=False)
+    except Exception:
+        LOGGER.exception("El polling de Telegram terminó por un fallo.")
+        raise
+    else:
+        LOGGER.info("El polling de Telegram terminó normalmente.")
+    finally:
+        servidor.shutdown()
+        servidor.server_close()
+        LOGGER.info("Servidor HTTP de Render detenido.")
 
 
 def main():

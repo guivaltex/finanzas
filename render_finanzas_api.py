@@ -27,8 +27,9 @@ def _autorizado(encabezado, secreto):
     return hmac.compare_digest(encabezado[len(prefijo):], secreto)
 
 
-def crear_manejador(cola, secreto):
+def crear_manejador(cola, secreto, estado_telegram=None):
     secreto = validar_secreto(secreto)
+    estado_telegram = estado_telegram or (lambda: True)
 
     class ManejadorFinanzas(BaseHTTPRequestHandler):
         server_version = "GuivaltexRender/1"
@@ -36,7 +37,7 @@ def crear_manejador(cola, secreto):
         def log_message(self, formato, *args):
             return
 
-        def responder(self, estado, contenido):
+        def responder(self, estado, contenido, enviar_cuerpo=True):
             cuerpo = json.dumps(
                 contenido, ensure_ascii=False, allow_nan=False,
                 sort_keys=True, separators=(",", ":"),
@@ -46,7 +47,29 @@ def crear_manejador(cola, secreto):
             self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", str(len(cuerpo)))
             self.end_headers()
-            self.wfile.write(cuerpo)
+            if enviar_cuerpo:
+                self.wfile.write(cuerpo)
+
+        def respuesta_publica(self, ruta):
+            if ruta == "/":
+                return 200, {
+                    "status": "ok", "http": "activo",
+                    "telegram": "no_comprobado",
+                }
+            if ruta != "/salud":
+                return None
+            try:
+                telegram_activo = bool(estado_telegram())
+            except Exception:
+                telegram_activo = False
+            return (
+                200 if telegram_activo else 503,
+                {
+                    "status": "ok" if telegram_activo else "error",
+                    "http": "activo",
+                    "telegram": "activo" if telegram_activo else "inactivo",
+                },
+            )
 
         def autenticar(self):
             if _autorizado(self.headers.get("Authorization"), secreto):
@@ -72,8 +95,9 @@ def crear_manejador(cola, secreto):
 
         def do_GET(self):
             ruta = urlsplit(self.path).path
-            if ruta in ("/", "/salud"):
-                self.responder(200, {"status": "ok"})
+            publica = self.respuesta_publica(ruta)
+            if publica is not None:
+                self.responder(*publica)
                 return
             if ruta != "/api/v1/movimientos/pendientes":
                 self.responder(404, {"status": "error", "codigo": "no_encontrado"})
@@ -87,6 +111,17 @@ def crear_manejador(cola, secreto):
                     503,
                     {"status": "error", "codigo": "cola_no_disponible"},
                 )
+
+        def do_HEAD(self):
+            ruta = urlsplit(self.path).path
+            publica = self.respuesta_publica(ruta)
+            if publica is not None:
+                self.responder(*publica, enviar_cuerpo=False)
+                return
+            self.responder(
+                404, {"status": "error", "codigo": "no_encontrado"},
+                enviar_cuerpo=False,
+            )
 
         def do_POST(self):
             ruta = urlsplit(self.path).path
@@ -115,8 +150,9 @@ def crear_manejador(cola, secreto):
     return ManejadorFinanzas
 
 
-def crear_servidor(cola, secreto, host="0.0.0.0", port=8080):
+def crear_servidor(cola, secreto, host="0.0.0.0", port=8080,
+                   estado_telegram=None):
     return ThreadingHTTPServer(
         (host, int(port)),
-        crear_manejador(cola, secreto),
+        crear_manejador(cola, secreto, estado_telegram),
     )
