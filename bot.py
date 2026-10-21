@@ -42,7 +42,7 @@ Reglas:
 - La entrada incluye campos_explicitos detectados del prefijo habitual
   y de las palabras empresa/fabrica/hogar. Si tipo o ambito no son null,
   copialos exactamente al JSON:
-  ninguna palabra del concepto puede sobrescribirlos.
+  solo las excepciones especiales de ambito indicadas abajo pueden cambiarlo.
 - clase=movimiento para gastos/ingresos externos normales.
 - clase=posible_abono para abonos, saldos o cobros que deben registrarse
   canonicamente desde el modulo Abonos de Guivaltex.
@@ -58,16 +58,36 @@ Reglas:
 - categoria debe ser exactamente una de las categorias entregadas.
 - Cada categoria incluye tipo, ambito, significado y señales. Descarta
   categorias incompatibles con el tipo o ambito ya resuelto.
-- Guantes es insumos y acarreo es transporte.
-- Los gastos sin categoria especifica fuerte pueden usar otros_gastos.
-- Prestamos o anticipos sobre sueldo requieren fuente_canonica_nomina.
+- Usa los significados de las categorias para inferir por contexto, sin limitarte
+  a una lista literal de palabras. otros_gastos solo si no existe categoria especifica.
+- Materiales e insumos se unifican en materiales, gasto de empresa. Incluye guantes,
+  regleta, Madecanto, ferreteria, portavasos, patas, sonido y compra de caja fuerte.
+  Reconoce tambien otros materiales/componentes/consumibles por su significado.
+- Acarreo o transporte de sillas es gasto de empresa/transporte salvo ambito explicito.
+- Pago de sueldo, costura/tapicero con sueldo, prestamo o anticipo sobre sueldo
+  es gasto de empresa/sueldos y clase=movimiento. No exige comprobante de nomina
+  ni debe marcarse fuente_canonica_nomina. No conviertas una devolucion recibida
+  de un prestamo en gasto ni inventes un pago.
+- Cuatro por mil, 4x1000 o GMF es gasto de empresa/impuestos.
+- Publicidad, pauta o anuncios es gasto de empresa/publicidad.
+- Compra o pago de colchon a proveedor para reventa es gasto de empresa/colchon;
+  la venta de colchon es ingreso de empresa/colchon. Distingue la operacion.
+- Cerveza, licor y otras bebidas alcoholicas son gasto de hogar/diversion;
+  esta y las reglas personales son excepciones especiales de ambito.
+- Tienda o tienda Alvaro usa onces/empresa como respaldo; si el audio dice hogar
+  usa comida/hogar, y si dice empresa usa onces/empresa. Alimentos concretos
+  como almuerzo o chorizos siguen la regla de alimentacion.
+- Alcancia o caja fuerte pueden describir una compra, gasto, ingreso externo o
+  traslado de fondos propios. Identifica quien paga/recibe y el motivo. Guardar
+  o retirar dinero propio no crea ingreso/gasto de la caja agregada. Si solo dice
+  hogar alcancia o no queda clara la operacion, requiere revision.
 - Jhoana/Joana/Jhohana y variaciones corresponden a hogar/Jhoana.
   Guillermo o Memo corresponden a hogar/Guillermo.
 - Transporte puede ser empresa u hogar. Conserva siempre el ambito explicito;
   solo infierelo por contexto cuando campos_explicitos.ambito sea null.
 - Con ambito explicito, nunca lo cambies por desayuno, almuerzo, comida, cena,
-  onces, refrigerios, transporte ni ninguna otra palabra del concepto.
-- Sin ambito explicito, desayuno/almuerzo/comida/cena usan comida y hogar como
+  onces, refrigerios o transporte; respeta las excepciones personales y de alcohol.
+- Sin ambito explicito, desayuno/almuerzo/comida/cena/chorizos usan comida y hogar como
   respaldo. Onces/refrigerios/tintos operativos usan onces y empresa.
 - No inventes factura_id. Conserva el identificador solo si fue mencionado.
 - Si falta evidencia, hay ambiguedad o la categoria no es clara, marca

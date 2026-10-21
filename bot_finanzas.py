@@ -41,7 +41,7 @@ CATEGORIAS_FINANCIERAS_V1 = {
     "venta": ("ingreso", "empresa"), "abono": ("ingreso", "empresa"),
     "saldo": ("ingreso", "empresa"), "base_cama": ("ingreso", "empresa"),
     "espaldar": ("ingreso", "empresa"), "sofa": ("ingreso", "empresa"),
-    "mesas": ("ingreso", "empresa"), "colchon": ("ingreso", "empresa"),
+    "mesas": ("ingreso", "empresa"), "colchon": (None, "empresa"),
     "silleteria": ("ingreso", "empresa"), "refaccion": ("ingreso", "empresa"),
     "comida": ("gasto", "hogar"), "transporte": ("gasto", None),
     "diversion": ("gasto", "hogar"), "dulce": ("gasto", "hogar"),
@@ -52,33 +52,70 @@ CATEGORIAS_FINANCIERAS_V1 = {
     "onces": ("gasto", "empresa"), "sueldos": ("gasto", "empresa"),
     "arriendo": ("gasto", "empresa"), "servicios_empresa": ("gasto", "empresa"),
     "deudas": ("gasto", "empresa"), "herramientas": ("gasto", "empresa"),
-    "insumos": ("gasto", "empresa"), "otros_ingresos": ("ingreso", None),
+    "impuestos": ("gasto", "empresa"), "publicidad": ("gasto", "empresa"),
+    "otros_ingresos": ("ingreso", None),
     "otros_gastos": ("gasto", None), "ajuste_caja": (None, None),
     "jhoana": ("gasto", "hogar"), "guillermo": ("gasto", "hogar"),
 }
-CATEGORIAS_RESERVADAS = frozenset(("abono", "saldo", "sueldos", "ajuste_caja"))
+CATEGORIAS_RESERVADAS = frozenset(("abono", "saldo", "ajuste_caja"))
+# Compatibilidad de respuestas anteriores; nunca emitir Insumos como categoria nueva.
+ALIASES_CATEGORIAS = {"insumos": "materiales"}
 NOMBRES_CATEGORIAS = {
     "base_cama": "Base cama", "servicios_hogar": "Servicios del hogar",
     "servicios_empresa": "Servicios de empresa",
     "otros_ingresos": "Otros ingresos", "otros_gastos": "Otros gastos",
     "ajuste_caja": "Ajuste de caja", "jhoana": "Jhoana",
-    "guillermo": "Guillermo",
+    "guillermo": "Guillermo", "colchon": "Colchon",
+    "impuestos": "Impuestos", "publicidad": "Publicidad",
 }
 SENALES_CATEGORIAS = {
-    "insumos": ("guantes",),
+    "materiales": ("materiales", "insumos", "guantes", "regleta", "Madecanto",
+                   "ferreteria", "portavasos", "patas", "sonido", "caja fuerte"),
+    "sueldos": ("sueldo", "salario", "nomina", "prestamo sobre sueldo",
+                "anticipo de sueldo", "pago tapicero sueldo"),
+    "impuestos": ("impuesto", "cuatro por mil", "4 por mil", "4x1000", "GMF"),
+    "publicidad": ("publicidad", "pauta", "anuncio", "Facebook verificado"),
+    "colchon": ("compra de colchon para reventa", "pago colchon", "venta colchon"),
+    "diversion": ("cerveza", "licor", "aguardiente", "ron", "whisky"),
     "transporte": ("acarreo", "transporte"),
     "onces": ("tinto", "tintos", "onces", "refrigerio"),
-    "comida": ("desayuno", "almuerzo", "comida", "cena"),
+    "comida": ("desayuno", "almuerzo", "comida", "cena", "chorizos", "tienda hogar"),
     "jhoana": ("Jhoana", "Joana", "Jhohana", "Johana", "Johanna"),
     "guillermo": ("Guillermo", "Memo"),
+}
+SIGNIFICADOS_INTERPRETACION = {
+    "materiales": "Gasto de empresa: materiales, componentes y consumibles de muebles. "
+                 "Incluye lo antes llamado insumos. Inferir por el objeto comprado, no "
+                 "solo por estas senales; no exige enumerar cada material. Una compra "
+                 "de colchon para reventa usa colchon. Ahorros o traslados no son materiales.",
+    "sueldos": "Gasto de empresa: pago de trabajo, salario, nomina o prestamo/anticipo "
+               "sobre sueldo. Permitir como movimiento externo sin exigir comprobante. "
+               "No reclasificar una devolucion recibida como gasto ni inventar un pago.",
+    "colchon": "Ingreso de empresa por venta de colchon, o gasto de empresa por compra "
+               "de colchon a un proveedor para reventa. El tipo depende de la operacion.",
+    "impuestos": "Gasto de empresa: impuestos, cuatro por mil / 4x1000 / GMF.",
+    "publicidad": "Gasto de empresa: anuncios, pauta, publicidad o Facebook verificado.",
+    "onces": "Gasto de empresa: refrigerios, tintos y compras de tienda para la fabrica.",
+    "comida": "Gasto de hogar: alimentacion, almuerzo, desayuno, cena, chorizos y tienda "
+              "cuando el audio dice hogar. Si dice empresa, alimentacion usa onces.",
+    "diversion": "Gasto de hogar: cerveza, licor y otras bebidas alcoholicas.",
+    "otros_ingresos": "Ingreso externo sin categoria mas especifica. Mencionar alcancia "
+                      "no basta: identificar quien entrega dinero y por que. Retirar "
+                      "fondos propios de una alcancia no crea ingreso agregado.",
+    "otros_gastos": "Gasto externo sin categoria mas especifica. No usar como escape "
+                    "para sueldos, materiales, transporte, comida o publicidad. Alcancia "
+                    "sin operacion clara requiere revision; ahorrar o mover fondos propios "
+                    "no es por si mismo gasto de la caja agregada.",
 }
 CATEGORIAS_INTERPRETACION = tuple(
     {
         "codigo": codigo,
         "tipo_permitido": regla[0],
         "ambito_permitido": regla[1],
-        "significado": NOMBRES_CATEGORIAS.get(
-            codigo, codigo.replace("_", " ").capitalize()
+        "significado": SIGNIFICADOS_INTERPRETACION.get(
+            codigo, NOMBRES_CATEGORIAS.get(
+                codigo, codigo.replace("_", " ").capitalize()
+            )
         ),
         "aliases_senales": list(SENALES_CATEGORIAS.get(codigo, ())),
     }
@@ -489,7 +526,7 @@ _REFRIGERIO_OPERATIVO = re.compile(
     r"\b(?:tinto|tintos|onces|refrigerio|refrigerios)\b"
 )
 _ALIMENTACION_HOGAR = re.compile(
-    r"\b(?:desayuno|desayunos|almuerzo|almuerzos|comida|comidas|cena|cenas)\b"
+    r"\b(?:desayuno|desayunos|almuerzo|almuerzos|comida|comidas|cena|cenas|chorizos?)\b"
 )
 _CATEGORIAS_ALIMENTACION = frozenset(("comida", "onces", "otros_gastos"))
 _NOMBRE_JHOANA = re.compile(r"\b(?:j|y)h?oh?a?n{1,2}a\b")
@@ -504,18 +541,81 @@ _SUELDO_NOMINA = re.compile(
 )
 
 
-def normalizar_reglas_negocio(tipo, categoria, ambito, concepto,
-                              transcripcion=None):
-    """Reglas fuertes y auditables anteriores a la inferencia del modelo."""
+_TIENDA = re.compile(r"\btiendas?\b")
+_TRANSPORTE = re.compile(r"\b(?:transporte|acarreos?)\b")
+_ALCOHOL = re.compile(
+    r"\b(?:cervezas?|licor(?:es)?|aguardiente|ron|whisk(?:e)?y|vodka|tequila)\b"
+)
+_IMPUESTOS = re.compile(
+    r"\b(?:impuestos?|gmf)\b|\b(?:cuatro|4)\s*(?:por|x)\s*(?:mil|1000)\b"
+)
+_PUBLICIDAD = re.compile(
+    r"\b(?:publicidad|pauta|anuncios?)\b|\bfacebook\s+verificad[oa]\b"
+)
+_MATERIALES = re.compile(
+    r"\b(?:material(?:es)?|insumos?|guantes?|regletas?|madecanto|ferreteria|"
+    r"portavasos|patas?|sonido|terlenca|satin|pranatex|madera|espuma|telas?|"
+    r"melamina|tiner|thinner)\b|\bcaja\s+fuerte\b"
+)
+_COLCHON = re.compile(r"\bcolchon(?:es)?\b")
+_ALCANCIA = re.compile(r"\balcancias?\b")
+_DEPOSITO_FONDOS = re.compile(r"\b(?:alcancias?|caja\s+(?:fuerte|ahorro))\b")
+_TRASLADO_FONDOS = re.compile(
+    r"\b(?:ahorro|ahorrar|ahorre|deposito|depositar|deposite|guardar|guarde|"
+    r"retirar|retiro|retire|sacar|saque|sacaron|sacamos|coger|cogi|cogieron|traslado|transferencia)\b"
+)
+_OPERACION_EXTERNA = re.compile(
+    r"\b(?:pague|pagamos|pagaron|pago|compre|compramos|compra|vendi|vendimos|venta|"
+    r"recibi|recibimos|regalo|regalaron|donacion|"
+    r"reparacion|arreglo|fabricacion|sonido|transporte)\b"
+)
+
+
+def es_traslado_fondos(concepto, transcripcion=None):
     texto = _texto_sin_tildes(transcripcion or concepto)
+    return bool(_DEPOSITO_FONDOS.search(texto)
+                and _TRASLADO_FONDOS.search(texto)
+                and not _OPERACION_EXTERNA.search(texto))
+
+
+def normalizar_reglas_negocio(tipo, categoria, ambito, concepto,
+                              transcripcion=None, ambito_explicito=False):
+    """Aplica reglas confirmadas; no cambia importes, fuente ni fechas."""
+    categoria = ALIASES_CATEGORIAS.get(categoria, categoria)
+    texto = _texto_sin_tildes(transcripcion or concepto)
+    empresa = ambito if ambito_explicito else "empresa"
+    if tipo == "gasto" and _SUELDO_NOMINA.search(texto):
+        return "sueldos", empresa, True
     if _NOMBRE_JHOANA.search(texto):
         return "jhoana", "hogar", True
     if _NOMBRE_GUILLERMO.search(texto):
         return "guillermo", "hogar", True
-    if tipo == "gasto" and _GUANTES.search(texto):
-        return "insumos", ambito, True
-    if tipo == "gasto" and _ACARREO.search(texto):
-        return "transporte", ambito, True
+    if tipo != "gasto":
+        return categoria, ambito, False
+    # Evita que caja fuerte vuelva materiales un ahorro/traslado de dinero.
+    if es_traslado_fondos(concepto, transcripcion):
+        return "otros_gastos", ambito, True
+    if _ALCOHOL.search(texto):
+        return "diversion", "hogar", True
+    if _IMPUESTOS.search(texto):
+        return "impuestos", empresa, True
+    if _PUBLICIDAD.search(texto):
+        return "publicidad", empresa, True
+    if _TRANSPORTE.search(texto):
+        return "transporte", empresa, True
+    if _COLCHON.search(texto):
+        return "colchon", empresa, True
+    if _MATERIALES.search(texto):
+        return "materiales", empresa, True
+    if (_REFRIGERIO_OPERATIVO.search(texto)
+            or _ALIMENTACION_HOGAR.search(texto)):
+        return normalizar_alimentacion(
+            tipo, "otros_gastos", ambito, concepto, ambito_explicito,
+            transcripcion
+        ) + (True,)
+    if _TIENDA.search(texto):
+        destino = ambito if ambito_explicito else "empresa"
+        return ("comida" if destino == "hogar" else "onces"), destino, True
     return categoria, ambito, False
 
 
@@ -567,7 +667,7 @@ def validar_interpretacion(external_id, respuesta, transcripcion=None):
 
     categoria_original, ambito_previo = categoria, ambito
     categoria, ambito, regla_fuerte = normalizar_reglas_negocio(
-        tipo, categoria, ambito, concepto, transcripcion
+        tipo, categoria, ambito, concepto, transcripcion, ambito_explicito
     )
     categoria, ambito = normalizar_alimentacion(
         tipo, categoria, ambito, concepto, ambito_explicito, transcripcion
@@ -600,9 +700,16 @@ def validar_interpretacion(external_id, respuesta, transcripcion=None):
     )
 
     motivos = []
+    if (categoria_original is not None
+            and categoria_original not in CATEGORIAS_FINANCIERAS_V1
+            and categoria_original not in ALIASES_CATEGORIAS):
+        agregar_motivo(motivos, "categoria_invalida")
     if datos["requiere_revision"]:
         for motivo in datos["motivos_revision"]:
             motivo_normalizado = _texto_sin_tildes(motivo)
+            if (tipo == "gasto" and categoria == "sueldos"
+                    and motivo_normalizado == "fuente_canonica_nomina"):
+                continue
             if ((tipo_explicito and "tipo" in motivo_normalizado)
                     or (ambito_resuelto and "ambito" in motivo_normalizado)
                     or (categoria_resuelta
@@ -616,9 +723,13 @@ def validar_interpretacion(external_id, respuesta, transcripcion=None):
         agregar_motivo(motivos, "nota_no_financiera")
     if clase == "posible_abono":
         agregar_motivo(motivos, "posible_abono_canonico")
-    fuente_nomina = es_fuente_canonica_nomina(concepto, transcripcion)
-    if fuente_nomina:
-        agregar_motivo(motivos, "fuente_canonica_nomina")
+    if es_traslado_fondos(concepto, transcripcion):
+        agregar_motivo(motivos, "contradiccion_datos")
+    elif (_ALCANCIA.search(_texto_sin_tildes(transcripcion or concepto))
+            and categoria in (None, "otros_gastos", "otros_ingresos")
+            and not _OPERACION_EXTERNA.search(
+                _texto_sin_tildes(transcripcion or concepto))):
+        agregar_motivo(motivos, "transcripcion_insuficiente")
 
     if tipo not in ("ingreso", "gasto"):
         agregar_motivo(motivos, "tipo_invalido")
@@ -635,8 +746,7 @@ def validar_interpretacion(external_id, respuesta, transcripcion=None):
             agregar_motivo(motivos, "categoria_tipo_incompatible")
         if ambito_categoria is not None and ambito != ambito_categoria:
             agregar_motivo(motivos, "categoria_ambito_incompatible")
-        if categoria in CATEGORIAS_RESERVADAS and not (
-                fuente_nomina and categoria == "sueldos"):
+        if categoria in CATEGORIAS_RESERVADAS:
             agregar_motivo(motivos, "categoria_reservada_fuente_canonica")
 
     if factura_id is not None:

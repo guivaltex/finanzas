@@ -222,6 +222,9 @@ def _validar_datos(conn, tipo, centavos, fecha_efectiva, concepto, ambito,
     if fecha_efectiva < apertura['fecha_inicio']:
         raise ErrorFinanzas('La fecha es anterior al inicio financiero configurado.')
     concepto = _texto(concepto, 'el concepto')
+    # Compatibilidad con audios pendientes del clasificador anterior.
+    if origen == 'render_telegram' and categoria_codigo == 'insumos':
+        categoria_codigo = 'materiales'
     categoria_codigo = _categoria(conn, categoria_codigo, tipo, ambito)
     factura_id = str(factura_id).strip() if factura_id is not None else None
     factura_id = factura_id or None
@@ -239,8 +242,8 @@ def _validar_datos(conn, tipo, centavos, fecha_efectiva, concepto, ambito,
     if origen in ('manual', 'render_telegram'):
         if categoria_codigo in ('abono', 'saldo') or (tipo == 'ingreso' and factura_id):
             raise ErrorFinanzas('Los abonos se registran desde su fuente canonica en Guivaltex.')
-        if categoria_codigo == 'sueldos':
-            raise ErrorFinanzas('La nomina se registra desde su fuente canonica en Guivaltex.')
+        if origen == 'manual' and categoria_codigo == 'sueldos':
+            raise ErrorFinanzas('Los sueldos se registran por audio o desde su fuente de nomina.')
     return {
         'tipo': tipo, 'importe_centavos': centavos, 'fecha_efectiva': fecha_efectiva,
         'concepto': concepto, 'ambito': ambito, 'categoria_codigo': categoria_codigo,
@@ -526,9 +529,12 @@ def resolver_excepcion_render(conn, external_id, datos_financieros):
     previa = _recepcion(conn, external_id)
     if previa is None:
         raise ErrorFinanzas('Recepcion externa inexistente.')
+    if previa['estado_resolucion'] == 'descartado':
+        raise ErrorFinanzas('La recepcion fue descartada y no puede convertirse.')
     if previa['convertido_en'] is not None:
         raise ErrorFinanzas('La recepcion ya fue convertida.')
-    if previa['estado_interpretacion'] != 'excepcion':
+    if (previa['estado_interpretacion'] != 'excepcion'
+            or previa['estado_resolucion'] != 'pendiente'):
         raise ErrorFinanzas('La recepcion no esta pendiente de revision.')
     if not isinstance(datos_financieros, dict):
         raise ErrorFinanzas('La revision requiere datos financieros.')
@@ -542,6 +548,29 @@ def resolver_excepcion_render(conn, external_id, datos_financieros):
     return _recepcion(conn, external_id)
 
 
+def descartar_excepcion_render(conn, external_id):
+    """Cierra una excepción sin crear movimiento ni borrar la recepción."""
+    _exigir_escritura(conn)
+    external_id = _external_id(external_id)
+    previa = _recepcion(conn, external_id)
+    if previa is None:
+        raise ErrorFinanzas('Recepcion externa inexistente.')
+    if previa['estado_resolucion'] == 'descartado':
+        return previa, True
+    if (previa['convertido_en'] is not None
+            or previa['estado_resolucion'] == 'convertido'):
+        raise ErrorFinanzas('La recepcion ya fue convertida.')
+    if previa['estado_interpretacion'] != 'excepcion':
+        raise ErrorFinanzas('La recepcion no esta pendiente de revision.')
+    conn.execute(
+        """UPDATE recepciones_render
+           SET estado_resolucion='descartado',revisado_en=?
+           WHERE external_id=?""",
+        (_ahora_utc(), external_id),
+    )
+    return _recepcion(conn, external_id), False
+
+
 def actualizar_detalle_excepcion_render(conn, external_id, detalle):
     """Conserva un motivo local seguro sin perder identidad ni payload original."""
     _exigir_escritura(conn)
@@ -549,9 +578,12 @@ def actualizar_detalle_excepcion_render(conn, external_id, detalle):
     previa = _recepcion(conn, external_id)
     if previa is None:
         raise ErrorFinanzas('Recepcion externa inexistente.')
+    if previa['estado_resolucion'] == 'descartado':
+        raise ErrorFinanzas('La recepcion fue descartada.')
     if previa['convertido_en'] is not None:
         raise ErrorFinanzas('La recepcion ya fue convertida.')
-    if previa['estado_interpretacion'] != 'excepcion':
+    if (previa['estado_interpretacion'] != 'excepcion'
+            or previa['estado_resolucion'] != 'pendiente'):
         raise ErrorFinanzas('La recepcion no esta pendiente de revision.')
     conn.execute(
         """UPDATE recepciones_render
@@ -567,6 +599,8 @@ def convertir_recepcion_render(conn, external_id):
     recepcion = _recepcion(conn, external_id)
     if recepcion is None:
         raise ErrorFinanzas('Recepcion externa inexistente.')
+    if recepcion['estado_resolucion'] == 'descartado':
+        raise ErrorFinanzas('La recepcion fue descartada y no puede convertirse.')
     existente = _una(
         conn, 'SELECT * FROM movimientos_financieros WHERE recepcion_external_id=?',
         (external_id,),
@@ -591,7 +625,9 @@ def convertir_recepcion_render(conn, external_id):
         recepcion_external_id=external_id,
     )
     conn.execute(
-        'UPDATE recepciones_render SET convertido_en=? WHERE external_id=?',
+        """UPDATE recepciones_render
+           SET convertido_en=?,estado_resolucion='convertido'
+           WHERE external_id=?""",
         (_ahora_utc(), external_id),
     )
     return movimiento, False
